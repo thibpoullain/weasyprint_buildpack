@@ -1,0 +1,15 @@
+# Fichiers temporaires
+*.tmp
+*.log
+.DS_Store
+
+# Répertoires de test
+test/
+tmp/
+
+# Environnements Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+EOF

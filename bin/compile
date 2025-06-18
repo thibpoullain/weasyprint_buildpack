@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# Script de compilation autonome du buildpack WeasyPrint pour Scalingo
+# Installe les dépendances système de manière autonome
+
+set -euo pipefail
+
+# Arguments fournis par Scalingo
+BUILD_DIR="${1}"
+CACHE_DIR="${2}"
+ENV_DIR="${3}"
+
+# Répertoires importants
+BP_DIR=$(cd "$(dirname "$(dirname "${BASH_SOURCE[0]}")")" && pwd)
+VENDOR_DIR="${BUILD_DIR}/.scalingo/weasyprint"
+PROFILE_DIR="${BUILD_DIR}/.profile.d"
+
+# URL des paquets précompilés (vous devrez les héberger)
+WEASYPRINT_DEPS_URL="${WEASYPRINT_DEPS_URL:-https://github.com/thibpoullain/weasyprint-deps/releases/download/v1.0.0}"
+
+# Fonctions utilitaires
+indent() {
+    sed -u 's/^/       /'
+}
+
+topic() {
+    echo "-----> $*"
+}
+
+error() {
+    echo " !     $*" >&2
+    exit 1
+}
+
+# Créer les répertoires nécessaires
+mkdir -p "${VENDOR_DIR}"
+mkdir -p "${PROFILE_DIR}"
+mkdir -p "${CACHE_DIR}"
+
+# ========== MÉTHODE 1: TÉLÉCHARGER DES BINAIRES PRÉCOMPILÉS ==========
+# Cette méthode est similaire à ce que font les buildpacks officiels
+
+download_precompiled_deps() {
+    topic "Téléchargement des dépendances précompilées pour WeasyPrint"
+
+    local deps_archive="weasyprint-deps-${STACK}-${ARCH}.tar.gz"
+    local cache_file="${CACHE_DIR}/${deps_archive}"
+
+    # Utiliser le cache si disponible et récent (moins de 7 jours)
+    if [[ -f "${cache_file}" ]] && [[ $(find "${cache_file}" -mtime -7 -print) ]]; then
+        echo "       Utilisation du cache pour les dépendances"
+    else
+        echo "       Téléchargement des dépendances..."
+        curl -L --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 300 \
+             -o "${cache_file}" \
+             "${WEASYPRINT_DEPS_URL}/${deps_archive}" 2>&1 | indent || {
+            error "Impossible de télécharger les dépendances précompilées"
+        }
+    fi
+
+    echo "       Extraction des dépendances..."
+    tar -xzf "${cache_file}" -C "${VENDOR_DIR}" 2>&1 | indent
+    echo "       ✓ Dépendances installées dans ${VENDOR_DIR}"
+}
+
+# ========== MÉTHODE 2: COPIER LES BIBLIOTHÈQUES DEPUIS LE SYSTÈME ==========
+# Si vous ne pouvez pas héberger des binaires précompilés
+
+copy_system_libraries() {
+    topic "Copie des bibliothèques système nécessaires"
+
+    # Créer la structure de répertoires
+    mkdir -p "${VENDOR_DIR}/lib"
+    mkdir -p "${VENDOR_DIR}/include"
+
+    # Liste des bibliothèques à copier
+    local libs=(
+        "libcairo.so*"
+        "libpango-1.0.so*"
+        "libpangocairo-1.0.so*"
+        "libpangoft2-1.0.so*"
+        "libgdk_pixbuf-2.0.so*"
+        "libharfbuzz.so*"
+        "libfontconfig.so*"
+        "libfreetype.so*"
+        "libpixman-1.so*"
+        "libxcb.so*"
+        "libxcb-render.so*"
+        "libxcb-shm.so*"
+        "libX11.so*"
+        "libXext.so*"
+        "libXrender.so*"
+    )
+
+    # Copier les bibliothèques depuis les emplacements standards
+    for lib_pattern in "${libs[@]}"; do
+        echo "       Recherche de ${lib_pattern}..."
+        find /usr/lib /usr/lib/x86_64-linux-gnu /lib /lib/x86_64-linux-gnu \
+             -name "${lib_pattern}" -type f 2>/dev/null | while read -r lib; do
+            if [[ -f "${lib}" ]]; then
+                echo "       → Copie de $(basename "${lib}")"
+                cp -P "${lib}" "${VENDOR_DIR}/lib/" 2>/dev/null || true
+            fi
+        done
+    done
+
+    # Copier les fichiers d'en-tête nécessaires
+    if [[ -d "/usr/include/cairo" ]]; then
+        cp -r "/usr/include/cairo" "${VENDOR_DIR}/include/"
+    fi
+    if [[ -d "/usr/include/pango-1.0" ]]; then
+        cp -r "/usr/include/pango-1.0" "${VENDOR_DIR}/include/"
+    fi
+}
+
+# ========== MÉTHODE 3: UTILISER LD_LIBRARY_PATH AVEC LES LIBS DU SYSTÈME ==========
+# La méthode la plus simple mais qui dépend de ce qui est installé sur l'image de base
+
+setup_library_paths() {
+    topic "Configuration des chemins de bibliothèques"
+
+    # Vérifier quelles bibliothèques sont disponibles dans l'image de base
+    local system_libs=""
+
+    # Chemins standards où chercher les bibliothèques
+    local lib_paths=(
+        "/usr/lib/x86_64-linux-gnu"
+        "/usr/lib"
+        "/lib/x86_64-linux-gnu"
+        "/lib"
+    )
+
+    for path in "${lib_paths[@]}"; do
+        if [[ -d "${path}" ]] && ls "${path}"/libcairo.so* >/dev/null 2>&1; then
+            system_libs="${system_libs}:${path}"
+            echo "       ✓ Bibliothèques trouvées dans ${path}"
+        fi
+    done
+
+    if [[ -z "${system_libs}" ]]; then
+        error "Les bibliothèques Cairo/Pango ne sont pas disponibles dans l'image de base"
+    fi
+
+    # Sauvegarder les chemins pour le runtime
+    echo "${system_libs}" > "${VENDOR_DIR}/system_lib_paths"
+}
+
+# ========== INSTALLATION DES DÉPENDANCES PYTHON ==========
+
+install_python_dependencies() {
+    topic "Configuration des dépendances Python pour WeasyPrint"
+
+    # S'assurer que les bonnes versions sont dans requirements.txt
+    if [[ -f "${BUILD_DIR}/requirements.txt" ]]; then
+        # Ajouter cairocffi et cffi s'ils ne sont pas présents
+        if ! grep -qi "cairocffi" "${BUILD_DIR}/requirements.txt"; then
+            echo "       Ajout de cairocffi aux dépendances..."
+            echo "cairocffi>=1.3.0" >> "${BUILD_DIR}/requirements.txt"
+        fi
+
+        if ! grep -qi "cffi" "${BUILD_DIR}/requirements.txt"; then
+            echo "       Ajout de cffi aux dépendances..."
+            echo "cffi>=1.15.0" >> "${BUILD_DIR}/requirements.txt"
+        fi
+    fi
+}
+
+# ========== CRÉATION DU SCRIPT D'ENVIRONNEMENT ==========
+
+create_runtime_profile() {
+    topic "Création du script d'environnement runtime"
+
+    cat > "${PROFILE_DIR}/weasyprint.sh" << 'EOF'
+#!/bin/bash
+# Configuration de l'environnement WeasyPrint au runtime
+
+# Répertoire des dépendances WeasyPrint
+WEASYPRINT_VENDOR_DIR="${HOME}/.scalingo/weasyprint"
+
+# Configuration des chemins de bibliothèques
+if [[ -f "${WEASYPRINT_VENDOR_DIR}/system_lib_paths" ]]; then
+    # Utiliser les chemins système identifiés pendant le build
+    SYSTEM_LIBS=$(cat "${WEASYPRINT_VENDOR_DIR}/system_lib_paths")
+    export LD_LIBRARY_PATH="${WEASYPRINT_VENDOR_DIR}/lib${SYSTEM_LIBS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+else
+    # Fallback : utiliser les chemins standards
+    export LD_LIBRARY_PATH="${WEASYPRINT_VENDOR_DIR}/lib:/usr/lib/x86_64-linux-gnu:/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
+export LIBRARY_PATH="${WEASYPRINT_VENDOR_DIR}/lib:/usr/lib/x86_64-linux-gnu:/usr/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+export C_INCLUDE_PATH="${WEASYPRINT_VENDOR_DIR}/include${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}"
+export CPLUS_INCLUDE_PATH="${WEASYPRINT_VENDOR_DIR}/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+export PKG_CONFIG_PATH="${WEASYPRINT_VENDOR_DIR}/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+
+# Configuration spécifique Cairo/Pango
+export CAIRO_BACKEND="cairo"
+export PANGOCAIRO_BACKEND="fontconfig"
+
+# Configuration des polices
+export FONTCONFIG_PATH="/etc/fonts:${HOME}/.fonts"
+export FONTCONFIG_FILE="/etc/fonts/fonts.conf"
+
+# GDK-Pixbuf
+if [[ -d "/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0" ]]; then
+    export GDK_PIXBUF_MODULE_FILE="/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+    export GDK_PIXBUF_MODULEDIR="/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders"
+fi
+
+# Symlinks pour la compatibilité
+if [[ "${HOME}" != "/app" ]]; then
+    mkdir -p /app/.scalingo
+    ln -nsf "${HOME}/.scalingo/weasyprint" /app/.scalingo/weasyprint
+fi
+
+# Vérification rapide au démarrage
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import cairocffi" 2>/dev/null || {
+        echo "Warning: cairocffi import failed, WeasyPrint may not work properly" >&2
+    }
+fi
+EOF
+
+    chmod +x "${PROFILE_DIR}/weasyprint.sh"
+}
+
+# ========== VÉRIFICATION DES DÉPENDANCES ==========
+
+verify_installation() {
+    topic "Vérification de l'installation"
+
+    # Vérifier la présence des bibliothèques critiques
+    local required_libs=(
+        "libcairo.so"
+        "libpango-1.0.so"
+        "libpangocairo-1.0.so"
+    )
+
+    local missing_libs=()
+
+    for lib in "${required_libs[@]}"; do
+        if ! find "${VENDOR_DIR}/lib" /usr/lib /usr/lib/x86_64-linux-gnu \
+                  -name "${lib}*" -type f 2>/dev/null | grep -q .; then
+            missing_libs+=("${lib}")
+        fi
+    done
+
+    if [[ ${#missing_libs[@]} -gt 0 ]]; then
+        echo "       ⚠ Bibliothèques manquantes : ${missing_libs[*]}"
+        echo "       WeasyPrint pourrait ne pas fonctionner correctement"
+    else
+        echo "       ✓ Toutes les bibliothèques critiques sont présentes"
+    fi
+}
+
+# ========== FONCTION PRINCIPALE ==========
+
+main() {
+    topic "Buildpack WeasyPrint - Installation autonome"
+
+    # Déterminer la stratégie d'installation
+    if [[ -n "${WEASYPRINT_USE_PRECOMPILED:-}" ]]; then
+        # Option 1 : Utiliser des binaires précompilés (recommandé)
+        download_precompiled_deps
+    elif [[ -n "${WEASYPRINT_COPY_LIBS:-}" ]]; then
+        # Option 2 : Copier les bibliothèques du système
+        copy_system_libraries
+    else
+        # Option 3 : Configurer les chemins vers les libs système (par défaut)
+        setup_library_paths
+    fi
+
+    # Configurer les dépendances Python
+    install_python_dependencies
+
+    # Créer le script d'environnement
+    create_runtime_profile
+
+    # Vérifier l'installation
+    verify_installation
+
+    echo ""
+    echo "       Installation terminée !"
+    echo "       WeasyPrint sera installé par le buildpack Python"
+    echo ""
+}
+
+# Exécution
+main "$@"

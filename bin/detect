@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Script de détection du buildpack WeasyPrint
+# But : Vérifier si l'application nécessite WeasyPrint
+
+# Le premier argument est le répertoire de build
+BUILD_DIR=${1:-}
+
+# Fonction pour afficher des messages de debug (utile pour le développement)
+debug() {
+    if [ "${BUILDPACK_DEBUG:-}" = "true" ]; then
+        echo "       DEBUG: $1" >&2
+    fi
+}
+
+debug "Vérification de la présence de WeasyPrint dans l'application"
+
+# Vérifier dans requirements.txt (cas le plus courant)
+if [ -f "${BUILD_DIR}/requirements.txt" ]; then
+    debug "Fichier requirements.txt trouvé"
+    if grep -qi "weasyprint\|WeasyPrint" "${BUILD_DIR}/requirements.txt"; then
+        echo "WeasyPrint"
+        debug "WeasyPrint détecté dans requirements.txt"
+        exit 0
+    fi
+fi
+
+# Vérifier dans Pipfile (pour les projets utilisant Pipenv)
+if [ -f "${BUILD_DIR}/Pipfile" ]; then
+    debug "Fichier Pipfile trouvé"
+    if grep -qi "weasyprint" "${BUILD_DIR}/Pipfile"; then
+        echo "WeasyPrint"
+        debug "WeasyPrint détecté dans Pipfile"
+        exit 0
+    fi
+fi
+
+# Vérifier dans pyproject.toml (pour les projets modernes)
+if [ -f "${BUILD_DIR}/pyproject.toml" ]; then
+    debug "Fichier pyproject.toml trouvé"
+    if grep -qi "weasyprint" "${BUILD_DIR}/pyproject.toml"; then
+        echo "WeasyPrint"
+        debug "WeasyPrint détecté dans pyproject.toml"
+        exit 0
+    fi
+fi
+
+debug "WeasyPrint non détecté"
+exit 1

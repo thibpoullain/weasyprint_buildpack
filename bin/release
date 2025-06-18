@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Script de release du buildpack WeasyPrint
+# But : Fournir les métadonnées de configuration à Scalingo
+
+# Ce script génère un fichier YAML avec la configuration
+
+cat << YAML
+---
+# Variables d'environnement additionnelles
+config_vars:
+  # Chemins des bibliothèques
+  LD_LIBRARY_PATH: /app/.heroku/vendor/lib:/usr/lib/x86_64-linux-gnu:/usr/lib
+  LIBRARY_PATH: /app/.heroku/vendor/lib:/usr/lib/x86_64-linux-gnu:/usr/lib
+  PKG_CONFIG_PATH: /app/.heroku/vendor/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig
+  WBP_LOG: /app/weasyprint-buildpack.log
+
+  # Configuration des polices
+  FONTCONFIG_PATH: /app/.heroku/vendor/etc/fonts:/etc/fonts
+
+  # Note : Ne pas écraser PATH car Scalingo le gère
+
+# Process type par défaut (sera écrasé si un Procfile existe)
+default_process_types:
+  web: python app.py
+YAML
